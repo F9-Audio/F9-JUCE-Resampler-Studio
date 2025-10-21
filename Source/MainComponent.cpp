@@ -13,11 +13,11 @@ MainComponent::MainComponent()
     formatManager.registerBasicFormats();
 
     // Initialize audio system with basic stereo I/O
-    // Note: We use the custom callback to get access to input audio
     // setAudioChannels will set up deviceManager
     setAudioChannels(2, 2);  // 2 inputs, 2 outputs
 
     // Register our custom callback to capture input audio
+    // This runs ALONGSIDE AudioAppComponent's callback
     deviceManager.addAudioCallback(&customCallback);
 
     // Set window size (more compact than original)
@@ -139,6 +139,15 @@ void MainComponent::handleAudioCallback(const float* const* inputChannelData,
     // RAW AUDIO CALLBACK - We get both input and output here!
     // ============================================================================
 
+    // DEBUG: Log first few callbacks to verify it's being called
+    static int callbackCount = 0;
+    if (callbackCount < 3)
+    {
+        DBG("CustomCallback called: " + juce::String(numInputChannels) + " in, " +
+            juce::String(numOutputChannels) + " out, " + juce::String(numSamples) + " samples");
+        callbackCount++;
+    }
+
     // First, copy input to our input buffer for processing
     if (numInputChannels > 0 && inputChannelData != nullptr)
     {
@@ -151,6 +160,11 @@ void MainComponent::handleAudioCallback(const float* const* inputChannelData,
                 inputBuffer.copyFrom(ch, 0, inputChannelData[ch], numSamples);
             }
         }
+    }
+    else
+    {
+        // No input available
+        inputBuffer.setSize(0, 0);
     }
 
     // Now call the standard getNextAudioBlock for output processing
@@ -235,6 +249,20 @@ void MainComponent::getNextAudioBlock(const juce::AudioSourceChannelInfo& buffer
             // Capture input and look for impulse return
             // IMPORTANT: inputBuffer contains only the ACTIVE channels in sequential order (0, 1, 2...)
             // NOT the physical channel numbers. If we enabled channels 3-4, they appear as indices 0-1.
+
+            // DEBUG: Log input buffer status
+            static int debugCount = 0;
+            if (debugCount < 3)
+            {
+                DBG("Latency capture: inputBuffer has " + juce::String(inputBuffer.getNumChannels()) + " channels");
+                if (inputBuffer.getNumChannels() > 0)
+                {
+                    float maxLevel = inputBuffer.getMagnitude(0, numSamples);
+                    DBG("Input level: " + juce::String(maxLevel));
+                }
+                debugCount++;
+            }
+
             if (inputBuffer.getNumChannels() >= 2 && appState.hasInputPair)
             {
                 // Input channels are always sequential starting from 0
@@ -271,6 +299,18 @@ void MainComponent::getNextAudioBlock(const juce::AudioSourceChannelInfo& buffer
                     needsToCompleteLatencyMeasurement = true;
                     appState.isMeasuringLatency = false;
                 }
+            }
+            else
+            {
+                // Not enough input channels - fail immediately
+                if (capturedSamplesSinceImpulse > numSamples * 10) // Give it a few buffers
+                {
+                    DBG("ERROR: No input channels available for latency measurement!");
+                    appState.settings.measuredLatencySamples = -1;
+                    needsToCompleteLatencyMeasurement = true;
+                    appState.isMeasuringLatency = false;
+                }
+                capturedSamplesSinceImpulse += numSamples;
             }
         }
     }
@@ -675,6 +715,10 @@ void MainComponent::configureAudioDevice()
                          ", " + juce::String(appState.selectedOutputPair.rightChannel));
     }
 
+    // DEBUG: Log what we're requesting
+    appState.appendLog("Requesting input channels: " + setup.inputChannels.toString(2));
+    appState.appendLog("Requesting output channels: " + setup.outputChannels.toString(2));
+
     // Apply the setup - this will reconfigure the already-running audio system
     juce::String error = deviceManager.setAudioDeviceSetup(setup, true);
 
@@ -686,6 +730,13 @@ void MainComponent::configureAudioDevice()
 
     // Verify the device was opened correctly
     auto* device = deviceManager.getCurrentAudioDevice();
+
+    // DEBUG: Log what was actually enabled
+    if (device != nullptr)
+    {
+        appState.appendLog("Active input channels: " + device->getActiveInputChannels().toString(2));
+        appState.appendLog("Active output channels: " + device->getActiveOutputChannels().toString(2));
+    }
     if (device == nullptr)
     {
         appState.appendLog("Error: Device failed to open");
