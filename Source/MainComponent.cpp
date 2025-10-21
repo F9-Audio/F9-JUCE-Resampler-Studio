@@ -335,7 +335,7 @@ void MainComponent::timerCallback()
         if (appState.settings.measuredLatencySamples >= 0)
         {
             double latencyMs = appState.settings.getLatencyInMs();
-            appState.appendLog("✓ Latency measurement successful!");
+            appState.appendLog("SUCCESS: Latency measurement complete!");
             appState.appendLog("  Measured latency: " + juce::String(appState.settings.measuredLatencySamples) +
                              " samples (" + juce::String(latencyMs, 2) + " ms)");
             appState.appendLog("  Audio loop detected and working correctly");
@@ -348,7 +348,7 @@ void MainComponent::timerCallback()
         }
         else
         {
-            appState.appendLog("✗ Latency measurement failed - no audio loop detected");
+            appState.appendLog("FAILED: Latency measurement - no audio loop detected");
             appState.appendLog("  Please check:");
             appState.appendLog("  1. Hardware loopback cable is connected");
             appState.appendLog("  2. Correct input/output pairs are selected");
