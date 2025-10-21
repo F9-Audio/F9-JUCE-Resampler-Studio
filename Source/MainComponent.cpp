@@ -699,28 +699,43 @@ void MainComponent::configureAudioDevice()
     appState.settings.measuredLatencySamples = -1;
     appState.settings.hasNoiseFloorMeasurement = false;
 
-    // CRITICAL FIX: The sequence matters!
-    // 1. setAudioDeviceSetup configures device
-    // 2. shutdownAudio stops callbacks
-    // 3. setAudioChannels restarts callbacks
-    // 4. setAudioDeviceSetup AGAIN to ensure device config sticks after restart
+    // CRITICAL: AudioDeviceManager needs to have the audio system active to route I/O
+    // We must call setAudioChannels() BEFORE setAudioDeviceSetup(), not after!
+    // This ensures the AudioAppComponent's audio callback is registered before device config.
 
     int numInputChannels = setup.inputChannels.countNumberOfSetBits();
     int numOutputChannels = setup.outputChannels.countNumberOfSetBits();
 
-    // Stop audio and restart with correct channel count
-    shutdownAudio();
-    setAudioChannels(numInputChannels, numOutputChannels);
+    // Get the current audio device state
+    auto* currentDevice = deviceManager.getCurrentAudioDevice();
+    bool wasAudioActive = (currentDevice != nullptr);
 
-    // Re-apply device setup to ensure our device/channels are used
+    if (!wasAudioActive)
+    {
+        // First time setup: Initialize AudioAppComponent with channel count
+        // This registers our getNextAudioBlock() callback with the deviceManager
+        setAudioChannels(numInputChannels, numOutputChannels);
+        appState.appendLog("Initialized audio system with " +
+                         juce::String(numInputChannels) + " in, " +
+                         juce::String(numOutputChannels) + " out");
+    }
+    else
+    {
+        // Audio already active: Just reconfigure without shutdown
+        // setAudioDeviceSetup will handle the reconfiguration internally
+        appState.appendLog("Reconfiguring active audio device...");
+    }
+
+    // Now apply device setup - this preserves the specific channel routing
+    // The AudioDeviceManager will reconfigure the device while keeping callbacks active
     juce::String error2 = deviceManager.setAudioDeviceSetup(setup, true);
 
     if (error2.isEmpty())
-        appState.appendLog("Audio I/O restarted with configured device: " +
+        appState.appendLog("Audio I/O configured: " +
                          juce::String(numInputChannels) + " in, " +
                          juce::String(numOutputChannels) + " out");
     else
-        appState.appendLog("Warning after restart: " + error2);
+        appState.appendLog("Warning during configuration: " + error2);
 }
 
 //==============================================================================
