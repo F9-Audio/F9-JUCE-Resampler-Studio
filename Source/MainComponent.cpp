@@ -118,9 +118,32 @@ void MainComponent::releaseResources()
 
 void MainComponent::getNextAudioBlock(const juce::AudioSourceChannelInfo& bufferToFill)
 {
-    // CRITICAL: Do NOT clear the buffer at start!
-    // bufferToFill contains INPUT audio when callback starts
-    // We only clear AFTER reading input, or when we don't need input
+    // CRITICAL CONCEPT: In AudioAppComponent's callback:
+    // - bufferToFill.buffer is BOTH input AND output
+    // - Input data arrives in the buffer when callback starts
+    // - We read input FIRST, then write output (which overwrites input)
+    // - We must route specific hardware channels to/from our internal stereo buffers
+
+    auto* device = deviceManager.getCurrentAudioDevice();
+    if (device == nullptr)
+    {
+        bufferToFill.clearActiveBufferRegion();
+        return;
+    }
+
+    const int numSamples = bufferToFill.numSamples;
+    const int numChannels = bufferToFill.buffer->getNumChannels();
+
+    // Get user-selected channel indices (0-indexed)
+    // These are the hardware channels the user wants to use
+    int outputLeftCh = juce::jmax(0, appState.selectedOutputPair.leftChannel - 1);
+    int outputRightCh = juce::jmax(0, appState.selectedOutputPair.rightChannel - 1);
+    int inputLeftCh = juce::jmax(0, appState.selectedInputPair.leftChannel - 1);
+    int inputRightCh = juce::jmax(0, appState.selectedInputPair.rightChannel - 1);
+
+    // Validate channels are within range
+    bool validOutputs = appState.hasOutputPair && outputRightCh < numChannels;
+    bool validInputs = appState.hasInputPair && inputRightCh < numChannels;
 
     // State machine: route processing based on appState flags
 
@@ -130,48 +153,62 @@ void MainComponent::getNextAudioBlock(const juce::AudioSourceChannelInfo& buffer
         // PROCESSING MODE: Play file + Record input
         // ============================================================
 
-        const int numSamples = bufferToFill.numSamples;
-        const int numChannels = bufferToFill.buffer->getNumChannels();
-
-        // CRITICAL: In AudioAppComponent, bufferToFill contains INPUT when callback starts
-        // We MUST capture input FIRST before writing output, or input data will be lost!
-
-        // 1. FIRST - Record input to recording buffer (before output overwrites it)
-        const int inputChannels = juce::jmin(numChannels, 2);
-        if (recordingSamplePosition + numSamples < appState.recordingBuffer.getNumSamples())
+        // STEP 1: Capture input FIRST (from specific input channels)
+        if (validInputs && recordingSamplePosition + numSamples < appState.recordingBuffer.getNumSamples())
         {
-            for (int channel = 0; channel < inputChannels; ++channel)
-            {
-                float* recordDest = appState.recordingBuffer.getWritePointer(channel, (int)recordingSamplePosition);
-                const float* inputSource = bufferToFill.buffer->getReadPointer(channel, bufferToFill.startSample);
+            // Copy from hardware input LEFT channel to recording buffer LEFT
+            appState.recordingBuffer.copyFrom(
+                0,                              // dest channel (left)
+                (int)recordingSamplePosition,   // dest start sample
+                *bufferToFill.buffer,           // source buffer (hardware inputs)
+                inputLeftCh,                    // source channel (hardware channel)
+                bufferToFill.startSample,       // source start sample
+                numSamples                      // number of samples
+            );
 
-                // Copy input samples to recording buffer
-                for (int i = 0; i < numSamples; ++i)
-                {
-                    recordDest[i] = inputSource[i];
-                }
-            }
+            // Copy from hardware input RIGHT channel to recording buffer RIGHT
+            appState.recordingBuffer.copyFrom(
+                1,                              // dest channel (right)
+                (int)recordingSamplePosition,   // dest start sample
+                *bufferToFill.buffer,           // source buffer (hardware inputs)
+                inputRightCh,                   // source channel (hardware channel)
+                bufferToFill.startSample,       // source start sample
+                numSamples                      // number of samples
+            );
 
             recordingSamplePosition += numSamples;
         }
 
-        // 2. THEN - Play audio from current playback buffer (overwrites input in buffer)
-        if (playbackSamplePosition < appState.currentPlaybackBuffer.getNumSamples())
-        {
-            for (int channel = 0; channel < juce::jmin(numChannels, 2); ++channel)
-            {
-                const float* sourceData = appState.currentPlaybackBuffer.getReadPointer(channel);
-                float* destData = bufferToFill.buffer->getWritePointer(channel, bufferToFill.startSample);
+        // STEP 2: Clear ALL output channels (safety)
+        bufferToFill.clearActiveBufferRegion();
 
-                for (int i = 0; i < numSamples; ++i)
-                {
-                    juce::int64 srcPos = playbackSamplePosition + i;
-                    if (srcPos < appState.currentPlaybackBuffer.getNumSamples())
-                    {
-                        destData[i] = sourceData[srcPos];
-                    }
-                }
-            }
+        // STEP 3: Write playback to specific output channels
+        if (validOutputs && playbackSamplePosition < appState.currentPlaybackBuffer.getNumSamples())
+        {
+            int samplesToPlay = juce::jmin(
+                numSamples,
+                (int)(appState.currentPlaybackBuffer.getNumSamples() - playbackSamplePosition)
+            );
+
+            // Copy from playback buffer LEFT to hardware output LEFT channel
+            bufferToFill.buffer->copyFrom(
+                outputLeftCh,                   // dest channel (hardware channel)
+                bufferToFill.startSample,       // dest start sample
+                appState.currentPlaybackBuffer, // source buffer
+                0,                              // source channel (left)
+                (int)playbackSamplePosition,    // source start sample
+                samplesToPlay                   // number of samples
+            );
+
+            // Copy from playback buffer RIGHT to hardware output RIGHT channel
+            bufferToFill.buffer->copyFrom(
+                outputRightCh,                  // dest channel (hardware channel)
+                bufferToFill.startSample,       // dest start sample
+                appState.currentPlaybackBuffer, // source buffer
+                1,                              // source channel (right)
+                (int)playbackSamplePosition,    // source start sample
+                samplesToPlay                   // number of samples
+            );
         }
 
         playbackSamplePosition += numSamples;
@@ -247,19 +284,17 @@ void MainComponent::getNextAudioBlock(const juce::AudioSourceChannelInfo& buffer
         // LATENCY MEASUREMENT MODE: Send impulse + Capture return
         // ============================================================
 
-        const int numSamples = bufferToFill.numSamples;
-        const int numChannels = bufferToFill.buffer->getNumChannels();
-
         if (!impulseSent)
         {
-            // Send impulse on first buffer (can overwrite input, we don't need it)
-            juce::AudioBuffer<float> impulseBuffer(numChannels, numSamples);
-            generateImpulse(impulseBuffer);
+            // STEP 1: Clear all outputs
+            bufferToFill.clearActiveBufferRegion();
 
-            for (int ch = 0; ch < numChannels; ++ch)
+            // STEP 2: Send impulse to specific output channels
+            if (validOutputs)
             {
-                bufferToFill.buffer->copyFrom(ch, bufferToFill.startSample,
-                                              impulseBuffer, ch, 0, numSamples);
+                // Generate impulse (0.9 amplitude on first sample)
+                bufferToFill.buffer->setSample(outputLeftCh, bufferToFill.startSample, 0.9f);
+                bufferToFill.buffer->setSample(outputRightCh, bufferToFill.startSample, 0.9f);
             }
 
             impulseSent = true;
@@ -267,24 +302,38 @@ void MainComponent::getNextAudioBlock(const juce::AudioSourceChannelInfo& buffer
         }
         else
         {
-            // CRITICAL: Capture input FIRST (it's in bufferToFill.buffer)
-            const int captureChannels = juce::jmin(numChannels, 2);
-            int capturePos = capturedSamplesSinceImpulse;
-
-            if (capturePos + numSamples < appState.latencyCaptureBuffer.getNumSamples())
+            // STEP 1: Capture input from specific channels
+            if (validInputs)
             {
-                for (int ch = 0; ch < captureChannels; ++ch)
-                {
-                    appState.latencyCaptureBuffer.copyFrom(ch, capturePos,
-                                                           *bufferToFill.buffer, ch,
-                                                           bufferToFill.startSample,
-                                                           numSamples);
-                }
+                int capturePos = capturedSamplesSinceImpulse;
 
-                capturedSamplesSinceImpulse += numSamples;
+                if (capturePos + numSamples < appState.latencyCaptureBuffer.getNumSamples())
+                {
+                    // Copy from hardware input LEFT to capture buffer LEFT
+                    appState.latencyCaptureBuffer.copyFrom(
+                        0,                          // dest channel
+                        capturePos,                 // dest start sample
+                        *bufferToFill.buffer,       // source buffer
+                        inputLeftCh,                // source channel
+                        bufferToFill.startSample,   // source start sample
+                        numSamples                  // number of samples
+                    );
+
+                    // Copy from hardware input RIGHT to capture buffer RIGHT
+                    appState.latencyCaptureBuffer.copyFrom(
+                        1,                          // dest channel
+                        capturePos,                 // dest start sample
+                        *bufferToFill.buffer,       // source buffer
+                        inputRightCh,               // source channel
+                        bufferToFill.startSample,   // source start sample
+                        numSamples                  // number of samples
+                    );
+
+                    capturedSamplesSinceImpulse += numSamples;
+                }
             }
 
-            // NOW clear output (after capturing input)
+            // STEP 2: Clear output (silence)
             bufferToFill.clearActiveBufferRegion();
 
             // Check if we've captured enough (5 seconds max)
@@ -302,29 +351,40 @@ void MainComponent::getNextAudioBlock(const juce::AudioSourceChannelInfo& buffer
         // PREVIEW MODE: Play file only (no recording)
         // ============================================================
 
-        const int numSamples = bufferToFill.numSamples;
-        const int numChannels = bufferToFill.buffer->getNumChannels();
+        // Clear all outputs first
+        bufferToFill.clearActiveBufferRegion();
 
-        if (playbackSamplePosition < appState.currentPlaybackBuffer.getNumSamples())
+        // Play to specific output channels
+        if (validOutputs && playbackSamplePosition < appState.currentPlaybackBuffer.getNumSamples())
         {
-            for (int channel = 0; channel < juce::jmin(numChannels, 2); ++channel)
-            {
-                const float* sourceData = appState.currentPlaybackBuffer.getReadPointer(channel);
-                float* destData = bufferToFill.buffer->getWritePointer(channel, bufferToFill.startSample);
+            int samplesToPlay = juce::jmin(
+                numSamples,
+                (int)(appState.currentPlaybackBuffer.getNumSamples() - playbackSamplePosition)
+            );
 
-                for (int i = 0; i < numSamples; ++i)
-                {
-                    juce::int64 srcPos = playbackSamplePosition + i;
-                    if (srcPos < appState.currentPlaybackBuffer.getNumSamples())
-                    {
-                        destData[i] = sourceData[srcPos];
-                    }
-                }
-            }
+            // Copy LEFT channel
+            bufferToFill.buffer->copyFrom(
+                outputLeftCh,
+                bufferToFill.startSample,
+                appState.currentPlaybackBuffer,
+                0,
+                (int)playbackSamplePosition,
+                samplesToPlay
+            );
+
+            // Copy RIGHT channel
+            bufferToFill.buffer->copyFrom(
+                outputRightCh,
+                bufferToFill.startSample,
+                appState.currentPlaybackBuffer,
+                1,
+                (int)playbackSamplePosition,
+                samplesToPlay
+            );
 
             playbackSamplePosition += numSamples;
         }
-        else
+        else if (playbackSamplePosition >= appState.currentPlaybackBuffer.getNumSamples())
         {
             // Preview finished, load next or stop
             needsToLoadNextFile = true;
@@ -336,14 +396,30 @@ void MainComponent::getNextAudioBlock(const juce::AudioSourceChannelInfo& buffer
         // HARDWARE TEST MODE: Generate 1kHz sine wave
         // ============================================================
 
-        juce::AudioBuffer<float> sineBuffer(bufferToFill.buffer->getNumChannels(),
-                                            bufferToFill.numSamples);
-        generateSineWave(sineBuffer, bufferToFill.numSamples);
+        // Clear all outputs first
+        bufferToFill.clearActiveBufferRegion();
 
-        for (int ch = 0; ch < bufferToFill.buffer->getNumChannels(); ++ch)
+        // Generate sine wave to specific output channels
+        if (validOutputs)
         {
-            bufferToFill.buffer->copyFrom(ch, bufferToFill.startSample,
-                                          sineBuffer, ch, 0, bufferToFill.numSamples);
+            // Generate sine wave
+            const float amplitude = 0.5f;
+            const float phaseIncrement = (sineFrequency * 2.0f * juce::MathConstants<float>::pi) /
+                                         (float)appState.settings.sampleRate;
+
+            float* leftData = bufferToFill.buffer->getWritePointer(outputLeftCh, bufferToFill.startSample);
+            float* rightData = bufferToFill.buffer->getWritePointer(outputRightCh, bufferToFill.startSample);
+
+            for (int i = 0; i < numSamples; ++i)
+            {
+                float sample = amplitude * std::sin(sinePhase);
+                leftData[i] = sample;
+                rightData[i] = sample;
+
+                sinePhase += phaseIncrement;
+                if (sinePhase >= 2.0f * juce::MathConstants<float>::pi)
+                    sinePhase -= 2.0f * juce::MathConstants<float>::pi;
+            }
         }
     }
     else
@@ -699,41 +775,51 @@ void MainComponent::configureAudioDevice()
     appState.settings.measuredLatencySamples = -1;
     appState.settings.hasNoiseFloorMeasurement = false;
 
-    // CRITICAL: AudioDeviceManager needs to have the audio system active to route I/O
-    // We must call setAudioChannels() BEFORE setAudioDeviceSetup(), not after!
-    // This ensures the AudioAppComponent's audio callback is registered before device config.
+    // CRITICAL: We need to request the MAXIMUM channel count the device supports
+    // This gives us access to ALL channels, then we route specific ones in getNextAudioBlock()
+    // This is how MCFX and other multichannel apps work!
 
-    int numInputChannels = setup.inputChannels.countNumberOfSetBits();
-    int numOutputChannels = setup.outputChannels.countNumberOfSetBits();
+    int maxInputChannel = juce::jmax(appState.selectedInputPair.leftChannel, appState.selectedInputPair.rightChannel);
+    int maxOutputChannel = juce::jmax(appState.selectedOutputPair.leftChannel, appState.selectedOutputPair.rightChannel);
 
-    // Get the current audio device state
+    // Request enough channels to cover our selected pairs
+    int numInputChannels = maxInputChannel;   // Will be 0-indexed internally
+    int numOutputChannels = maxOutputChannel; // Will be 0-indexed internally
+
+    // Enable ALL channels up to our max (this is the key!)
+    setup.inputChannels.clear();
+    setup.outputChannels.clear();
+    setup.inputChannels.setRange(0, numInputChannels, true);  // Enable channels 0 to numInputChannels-1
+    setup.outputChannels.setRange(0, numOutputChannels, true); // Enable channels 0 to numOutputChannels-1
+
+    appState.appendLog("Requesting " + juce::String(numInputChannels) + " input channels, " +
+                      juce::String(numOutputChannels) + " output channels");
+
+    // Check if audio is already active
     auto* currentDevice = deviceManager.getCurrentAudioDevice();
     bool wasAudioActive = (currentDevice != nullptr);
 
     if (!wasAudioActive)
     {
-        // First time setup: Initialize AudioAppComponent with channel count
+        // First time setup: Initialize AudioAppComponent with enough channels
         // This registers our getNextAudioBlock() callback with the deviceManager
         setAudioChannels(numInputChannels, numOutputChannels);
-        appState.appendLog("Initialized audio system with " +
-                         juce::String(numInputChannels) + " in, " +
-                         juce::String(numOutputChannels) + " out");
-    }
-    else
-    {
-        // Audio already active: Just reconfigure without shutdown
-        // setAudioDeviceSetup will handle the reconfiguration internally
-        appState.appendLog("Reconfiguring active audio device...");
+        appState.appendLog("Initialized audio system");
     }
 
-    // Now apply device setup - this preserves the specific channel routing
-    // The AudioDeviceManager will reconfigure the device while keeping callbacks active
+    // Apply the device setup - this opens the device with all requested channels
     juce::String error2 = deviceManager.setAudioDeviceSetup(setup, true);
 
     if (error2.isEmpty())
-        appState.appendLog("Audio I/O configured: " +
-                         juce::String(numInputChannels) + " in, " +
-                         juce::String(numOutputChannels) + " out");
+    {
+        appState.appendLog("Audio I/O configured successfully");
+        appState.appendLog("Will use input channels: " +
+                         juce::String(appState.selectedInputPair.leftChannel) + "+" +
+                         juce::String(appState.selectedInputPair.rightChannel));
+        appState.appendLog("Will use output channels: " +
+                         juce::String(appState.selectedOutputPair.leftChannel) + "+" +
+                         juce::String(appState.selectedOutputPair.rightChannel));
+    }
     else
         appState.appendLog("Warning during configuration: " + error2);
 }
