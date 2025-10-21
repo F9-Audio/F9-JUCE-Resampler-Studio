@@ -163,3 +163,4 @@ node_modules/
 *.backup
 *.old
 .DS_Store
+.DS_Store
