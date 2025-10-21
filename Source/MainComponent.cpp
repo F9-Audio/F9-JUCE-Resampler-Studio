@@ -13,8 +13,12 @@ MainComponent::MainComponent()
     formatManager.registerBasicFormats();
 
     // Initialize audio system with basic stereo I/O
-    // This will use the default device temporarily until user selects one
+    // Note: We use the custom callback to get access to input audio
+    // setAudioChannels will set up deviceManager
     setAudioChannels(2, 2);  // 2 inputs, 2 outputs
+
+    // Register our custom callback to capture input audio
+    deviceManager.addAudioCallback(&customCallback);
 
     // Set window size (more compact than original)
     setSize(1100, 650);
@@ -89,6 +93,7 @@ MainComponent::MainComponent()
 
 MainComponent::~MainComponent()
 {
+    deviceManager.removeAudioCallback(&customCallback);
     shutdownAudio();
 }
 
@@ -124,34 +129,170 @@ void MainComponent::releaseResources()
     appState.appendLog("Audio resources released");
 }
 
+void MainComponent::handleAudioCallback(const float* const* inputChannelData,
+                                        int numInputChannels,
+                                        float* const* outputChannelData,
+                                        int numOutputChannels,
+                                        int numSamples)
+{
+    // ============================================================================
+    // RAW AUDIO CALLBACK - We get both input and output here!
+    // ============================================================================
+
+    // First, copy input to our input buffer for processing
+    if (numInputChannels > 0 && inputChannelData != nullptr)
+    {
+        inputBuffer.setSize(numInputChannels, numSamples, false, false, true);
+
+        for (int ch = 0; ch < numInputChannels; ++ch)
+        {
+            if (inputChannelData[ch] != nullptr)
+            {
+                inputBuffer.copyFrom(ch, 0, inputChannelData[ch], numSamples);
+            }
+        }
+    }
+
+    // Now call the standard getNextAudioBlock for output processing
+    // Create an AudioSourceChannelInfo wrapping the output buffers
+    juce::AudioBuffer<float> outputBuffer(outputChannelData, numOutputChannels, numSamples);
+    juce::AudioSourceChannelInfo bufferToFill;
+    bufferToFill.buffer = &outputBuffer;
+    bufferToFill.startSample = 0;
+    bufferToFill.numSamples = numSamples;
+
+    getNextAudioBlock(bufferToFill);
+}
+
 void MainComponent::getNextAudioBlock(const juce::AudioSourceChannelInfo& bufferToFill)
 {
     // ============================================================================
-    // SIMPLE AUDIO CALLBACK - Just test basic stereo output first
+    // AUDIO CALLBACK - Real-time audio processing state machine
     // ============================================================================
 
     const int numSamples = bufferToFill.numSamples;
     const int numChannels = bufferToFill.buffer->getNumChannels();
 
+    // CRITICAL: Capture input audio FIRST before processing
+    auto* device = deviceManager.getCurrentAudioDevice();
+    if (device != nullptr)
+    {
+        // Get input from device callback
+        auto activeInputChannels = device->getActiveInputChannels();
+        int numInputChannels = activeInputChannels.countNumberOfSetBits();
+
+        if (numInputChannels > 0)
+        {
+            // Copy input data to our input buffer for processing
+            inputBuffer.setSize(numInputChannels, numSamples, false, false, true);
+
+            // JUCE provides input in bufferToFill when AudioAppComponent is used
+            // We need to get it from the AudioDeviceManager's callback
+            // For now, we'll handle this in the specific modes below
+        }
+    }
+
     // Clear all outputs by default
     bufferToFill.clearActiveBufferRegion();
 
-    // State machine based on appState flags
+    // ============================================================================
+    // STATE MACHINE: Route audio based on operation mode
+    // ============================================================================
 
-    if (appState.isTestingHardware)
+    if (appState.isMeasuringLatency)
     {
-        // ============================================================
-        // HARDWARE TEST MODE: Generate 1kHz sine wave (stereo for now)
-        // ============================================================
+        // ================================================================
+        // LATENCY MEASUREMENT MODE
+        // Send impulse, capture response, detect peak position
+        // ================================================================
 
-        if (numChannels >= 2)
+        if (!impulseSent)
         {
-            const float amplitude = 0.5f;
+            // Send impulse on first buffer (single sample at max amplitude)
+            // IMPORTANT: Output buffer contains only ACTIVE channels in sequential order
+            // If we enabled output channels 3-4, they appear as indices 0-1 in the buffer
+            if (numChannels >= 2 && appState.hasOutputPair)
+            {
+                // Output channels are always sequential starting from 0
+                int leftCh = 0;
+                int rightCh = 1;
+
+                float* leftOut = bufferToFill.buffer->getWritePointer(leftCh, bufferToFill.startSample);
+                float* rightOut = bufferToFill.buffer->getWritePointer(rightCh, bufferToFill.startSample);
+
+                // Single impulse at max amplitude
+                leftOut[0] = 1.0f;
+                rightOut[0] = 1.0f;
+
+                impulseSent = true;
+                capturedSamplesSinceImpulse = 0;
+                appState.latencyCaptureBuffer.clear();
+                appState.latencyCaptureBuffer.setSize(2, static_cast<int>(appState.settings.sampleRate * 5), false, true);
+            }
+        }
+        else
+        {
+            // Capture input and look for impulse return
+            // IMPORTANT: inputBuffer contains only the ACTIVE channels in sequential order (0, 1, 2...)
+            // NOT the physical channel numbers. If we enabled channels 3-4, they appear as indices 0-1.
+            if (inputBuffer.getNumChannels() >= 2 && appState.hasInputPair)
+            {
+                // Input channels are always sequential starting from 0
+                int leftInCh = 0;
+                int rightInCh = 1;
+
+                // Copy input to capture buffer
+                int writePos = capturedSamplesSinceImpulse;
+                int samplesToWrite = juce::jmin(numSamples, appState.latencyCaptureBuffer.getNumSamples() - writePos);
+
+                if (samplesToWrite > 0)
+                {
+                    appState.latencyCaptureBuffer.copyFrom(0, writePos, inputBuffer, leftInCh, 0, samplesToWrite);
+                    appState.latencyCaptureBuffer.copyFrom(1, writePos, inputBuffer, rightInCh, 0, samplesToWrite);
+                }
+
+                capturedSamplesSinceImpulse += numSamples;
+
+                // Look for peak in the captured audio
+                int peakPosition = findPeakPosition(appState.latencyCaptureBuffer, 0.5f);
+
+                if (peakPosition >= 0)
+                {
+                    // Found the impulse return! Calculate latency
+                    appState.settings.measuredLatencySamples = peakPosition;
+                    appState.settings.lastBufferSizeWhenMeasured = appState.settings.bufferSize;
+                    needsToCompleteLatencyMeasurement = true;
+                    appState.isMeasuringLatency = false;
+                }
+                else if (capturedSamplesSinceImpulse > appState.settings.sampleRate * 5)
+                {
+                    // Timeout - no peak found
+                    appState.settings.measuredLatencySamples = -1;
+                    needsToCompleteLatencyMeasurement = true;
+                    appState.isMeasuringLatency = false;
+                }
+            }
+        }
+    }
+    else if (appState.isTestingHardware)
+    {
+        // ================================================================
+        // HARDWARE TEST MODE: Generate 1kHz sine wave
+        // ================================================================
+        // IMPORTANT: Output buffer contains only ACTIVE channels sequentially
+
+        if (numChannels >= 2 && appState.hasOutputPair)
+        {
+            // Output channels are always sequential starting from 0
+            int leftCh = 0;
+            int rightCh = 1;
+
+            const float amplitude = 0.3f;  // -10dB to be safe
             const float phaseIncrement = (sineFrequency * 2.0f * juce::MathConstants<float>::pi) /
                                          (float)appState.settings.sampleRate;
 
-            float* leftData = bufferToFill.buffer->getWritePointer(0, bufferToFill.startSample);
-            float* rightData = bufferToFill.buffer->getWritePointer(1, bufferToFill.startSample);
+            float* leftData = bufferToFill.buffer->getWritePointer(leftCh, bufferToFill.startSample);
+            float* rightData = bufferToFill.buffer->getWritePointer(rightCh, bufferToFill.startSample);
 
             for (int i = 0; i < numSamples; ++i)
             {
@@ -165,7 +306,20 @@ void MainComponent::getNextAudioBlock(const juce::AudioSourceChannelInfo& buffer
             }
         }
     }
-    // TODO: Implement other modes
+    else if (appState.isProcessing)
+    {
+        // ================================================================
+        // PROCESSING MODE: Play file through output, record from input
+        // TODO: Implement file processing
+        // ================================================================
+    }
+    else if (appState.isPreviewing)
+    {
+        // ================================================================
+        // PREVIEW MODE: Play selected files (no recording)
+        // TODO: Implement preview playback
+        // ================================================================
+    }
 }
 
 //==============================================================================
@@ -173,6 +327,37 @@ void MainComponent::getNextAudioBlock(const juce::AudioSourceChannelInfo& buffer
 
 void MainComponent::timerCallback()
 {
+    // Handle latency measurement completion
+    if (needsToCompleteLatencyMeasurement)
+    {
+        needsToCompleteLatencyMeasurement = false;
+
+        if (appState.settings.measuredLatencySamples >= 0)
+        {
+            double latencyMs = appState.settings.getLatencyInMs();
+            appState.appendLog("✓ Latency measurement successful!");
+            appState.appendLog("  Measured latency: " + juce::String(appState.settings.measuredLatencySamples) +
+                             " samples (" + juce::String(latencyMs, 2) + " ms)");
+            appState.appendLog("  Audio loop detected and working correctly");
+
+            // Also measure noise floor while we have captured audio
+            float noiseFloorDb = calculateNoiseFloorDb(appState.latencyCaptureBuffer);
+            appState.settings.measuredNoiseFloorDb = noiseFloorDb;
+            appState.settings.hasNoiseFloorMeasurement = true;
+            appState.appendLog("  Noise floor: " + juce::String(noiseFloorDb, 1) + " dB");
+        }
+        else
+        {
+            appState.appendLog("✗ Latency measurement failed - no audio loop detected");
+            appState.appendLog("  Please check:");
+            appState.appendLog("  1. Hardware loopback cable is connected");
+            appState.appendLog("  2. Correct input/output pairs are selected");
+            appState.appendLog("  3. Input monitoring is enabled on your interface");
+        }
+
+        settingsComponent.updateFromState();
+    }
+
     // Handle file saving (triggered by audio thread)
     if (needsToSaveCurrentFile)
     {
@@ -479,14 +664,14 @@ void MainComponent::configureAudioDevice()
     if (appState.hasInputPair)
     {
         setStereoBits(setup.inputChannels, appState.selectedInputPair);
-        appState.appendLog("Input channels: " + juce::String(appState.selectedInputPair.leftChannel) +
+        appState.appendLog("Enabled input channels: " + juce::String(appState.selectedInputPair.leftChannel) +
                          ", " + juce::String(appState.selectedInputPair.rightChannel));
     }
 
     if (appState.hasOutputPair)
     {
         setStereoBits(setup.outputChannels, appState.selectedOutputPair);
-        appState.appendLog("Output channels: " + juce::String(appState.selectedOutputPair.leftChannel) +
+        appState.appendLog("Enabled output channels: " + juce::String(appState.selectedOutputPair.leftChannel) +
                          ", " + juce::String(appState.selectedOutputPair.rightChannel));
     }
 
@@ -543,6 +728,12 @@ void MainComponent::configureAudioDevice()
 
 void MainComponent::addFiles(const juce::Array<juce::File>& files)
 {
+    if (files.isEmpty())
+        return;
+
+    int validCount = 0;
+    int invalidCount = 0;
+
     for (const auto& file : files)
     {
         AudioFile audioFile(file);
@@ -552,12 +743,29 @@ void MainComponent::addFiles(const juce::Array<juce::File>& files)
         {
             appState.appendLog("Added: " + audioFile.getFileName() +
                              " (" + juce::String(audioFile.sampleRate / 1000.0, 1) + " kHz)");
+            validCount++;
         }
         else
         {
-            appState.appendLog("Warning: Invalid sample rate - " + audioFile.getFileName());
+            appState.appendLog("Warning: Invalid sample rate - " + audioFile.getFileName() +
+                             " (" + juce::String(audioFile.sampleRate / 1000.0, 1) + " kHz, expected 44.1 kHz)");
+            invalidCount++;
         }
     }
+
+    // Summary log
+    juce::String summary = "Loaded " + juce::String(files.size()) + " file(s)";
+    if (validCount > 0)
+        summary += " (" + juce::String(validCount) + " valid";
+    if (invalidCount > 0)
+        summary += ", " + juce::String(invalidCount) + " invalid sample rate";
+    if (validCount > 0)
+        summary += ")";
+
+    appState.appendLog(summary);
+
+    // Update UI
+    fileListAndLogComponent.updateFromState();
 }
 
 void MainComponent::clearFiles()

@@ -11,7 +11,8 @@
  */
 class FileListAndLogComponent : public juce::Component,
                                  public juce::FileDragAndDropTarget,
-                                 public juce::Button::Listener
+                                 public juce::Button::Listener,
+                                 public juce::ListBoxModel
 {
 public:
     FileListAndLogComponent(AppState& state);
@@ -19,6 +20,7 @@ public:
 
     void paint(juce::Graphics&) override;
     void resized() override;
+    void mouseDown(const juce::MouseEvent& event) override;
 
     // File drag and drop
     bool isInterestedInFileDrag(const juce::StringArray& files) override;
@@ -28,6 +30,12 @@ public:
 
     // Button listener
     void buttonClicked(juce::Button* button) override;
+
+    // ListBoxModel overrides
+    int getNumRows() override;
+    void paintListBoxItem(int rowNumber, juce::Graphics& g, int width, int height, bool rowIsSelected) override;
+    void listBoxItemClicked(int row, const juce::MouseEvent& e) override;
+    juce::Component* refreshComponentForRow(int rowNumber, bool isRowSelected, juce::Component* existingComponentToUpdate) override;
 
     // Update from state
     void updateFromState();
@@ -44,6 +52,11 @@ private:
     // File drop zone
     bool isDraggingOver = false;
     juce::Rectangle<int> dropZoneBounds;
+    juce::Rectangle<int> fileAreaBounds;
+
+    // File list display
+    juce::ListBox fileListBox;
+    juce::TextButton selectAllButton;
 
     // Buttons
     juce::TextButton previewButton;
@@ -57,7 +70,7 @@ private:
     juce::Label fileCountLabel;
 
     void drawDropZone(juce::Graphics& g, juce::Rectangle<int> bounds);
-    void drawFileList(juce::Graphics& g, juce::Rectangle<int> bounds);
+    void showFileChooser();
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(FileListAndLogComponent)
 };

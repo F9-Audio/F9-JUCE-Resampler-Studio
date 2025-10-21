@@ -40,7 +40,7 @@ public:
      * Routes audio processing based on AppState flags
      * CRITICAL: Must be fast and lock-free!
      *
-     * NOTE: We access the AudioDeviceManager directly to get separate input buffers
+     * NOTE: We use a custom AudioIODeviceCallback to capture input
      */
     void getNextAudioBlock (const juce::AudioSourceChannelInfo& bufferToFill) override;
 
@@ -129,6 +129,32 @@ private:
     // Format manager for reading/writing audio files
     juce::AudioFormatManager formatManager;
 
+    // Custom audio callback to capture input
+    class CustomAudioCallback : public juce::AudioIODeviceCallback
+    {
+    public:
+        CustomAudioCallback(MainComponent& owner) : owner(owner) {}
+
+        void audioDeviceIOCallbackWithContext(const float* const* inputChannelData,
+                                              int numInputChannels,
+                                              float* const* outputChannelData,
+                                              int numOutputChannels,
+                                              int numSamples,
+                                              const juce::AudioIODeviceCallbackContext& context) override
+        {
+            owner.handleAudioCallback(inputChannelData, numInputChannels,
+                                     outputChannelData, numOutputChannels, numSamples);
+        }
+
+        void audioDeviceAboutToStart(juce::AudioIODevice* device) override {}
+        void audioDeviceStopped() override {}
+
+    private:
+        MainComponent& owner;
+    };
+
+    CustomAudioCallback customCallback{*this};
+
     // UI Components
     F9LookAndFeel lookAndFeel;
     SettingsComponent settingsComponent;
@@ -160,6 +186,16 @@ private:
 
     // Input buffer for capturing hardware inputs
     juce::AudioBuffer<float> inputBuffer;
+
+    //==============================================================================
+    // Helper Methods - Audio Callback
+
+    /** Handle raw audio device callback with both input and output */
+    void handleAudioCallback(const float* const* inputChannelData,
+                            int numInputChannels,
+                            float* const* outputChannelData,
+                            int numOutputChannels,
+                            int numSamples);
 
     //==============================================================================
     // Helper Methods - Device Management
