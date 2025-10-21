@@ -486,10 +486,23 @@ void MainComponent::timerCallback()
                     auto reader = formatManager.createReaderFor(appState.files[i].url);
                     if (reader != nullptr)
                     {
-                        appState.currentPlaybackBuffer.setSize((int)reader->numChannels,
-                                                              (int)reader->lengthInSamples);
-                        reader->read(&appState.currentPlaybackBuffer, 0,
-                                    (int)reader->lengthInSamples, 0, true, true);
+                        // --- THIS IS THE NEW, CORRECTED CODE ---
+                        
+                        // 1. Set our playback buffer to be STEREO and the correct length.
+                        appState.currentPlaybackBuffer.setSize(2, (int)reader->lengthInSamples);
+                        appState.currentPlaybackBuffer.clear();
+
+                        // 2. Read the file into the stereo buffer.
+                        //    If the file is mono, reader->read() will correctly copy it to both L/R channels.
+                        //    If the file is stereo, it will copy L->L and R->R.
+                        reader->read(&appState.currentPlaybackBuffer,    // dest buffer
+                                     0,                                // dest start sample
+                                     (int)reader->lengthInSamples,     // num samples
+                                     0,                                // file start sample
+                                     true,                             // use L channel
+                                     true);                            // use R channel
+                        
+                        // --- END OF NEW CODE ---
                         delete reader;
 
                         playbackSamplePosition = 0;
@@ -1008,9 +1021,23 @@ bool MainComponent::loadNextFileForProcessing()
         return false;
     }
 
-    // Load file into playback buffer
-    appState.currentPlaybackBuffer.setSize((int)reader->numChannels, (int)reader->lengthInSamples);
-    reader->read(&appState.currentPlaybackBuffer, 0, (int)reader->lengthInSamples, 0, true, true);
+    // --- THIS IS THE NEW, CORRECTED CODE ---
+    
+    // 1. Set our playback buffer to be STEREO and the correct length.
+    appState.currentPlaybackBuffer.setSize(2, (int)reader->lengthInSamples);
+    appState.currentPlaybackBuffer.clear();
+
+    // 2. Read the file into the stereo buffer.
+    //    If the file is mono, reader->read() will correctly copy it to both L/R channels.
+    //    If the file is stereo, it will copy L->L and R->R.
+    reader->read(&appState.currentPlaybackBuffer,    // dest buffer
+                 0,                                // dest start sample
+                 (int)reader->lengthInSamples,     // num samples
+                 0,                                // file start sample
+                 true,                             // use L channel
+                 true);                            // use R channel
+    
+    // --- END OF NEW CODE ---
     delete reader;
 
     file.status = ProcessingStatus::processing;
