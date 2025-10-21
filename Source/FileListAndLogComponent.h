@@ -45,6 +45,7 @@ public:
     std::function<void()> onPreviewClicked;
     std::function<void()> onProcessAllClicked;
     std::function<void()> onCopyLog;
+    std::function<void()> onClearAll;
 
 private:
     AppState& appState;
@@ -57,6 +58,7 @@ private:
     // File list display
     juce::ListBox fileListBox;
     juce::TextButton selectAllButton;
+    juce::TextButton clearAllButton;
 
     // Buttons
     juce::TextButton previewButton;

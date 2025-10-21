@@ -75,7 +75,13 @@ MainComponent::MainComponent()
     };
 
     fileListAndLogComponent.onFilesAdded = [this](const juce::Array<juce::File>& files) { addFiles(files); };
-    fileListAndLogComponent.onPreviewClicked = [this]() { startPreview(); };
+    fileListAndLogComponent.onPreviewClicked = [this]() 
+    { 
+        if (appState.isPreviewing)
+            stopPreview();
+        else
+            startPreview();
+    };
     fileListAndLogComponent.onProcessAllClicked = [this]() { startProcessing(); };
     fileListAndLogComponent.onCopyLog = [this]()
     {
@@ -84,6 +90,11 @@ MainComponent::MainComponent()
             logText += line + "\n";
         juce::SystemClipboard::copyTextToClipboard(logText);
         appState.appendLog("Log copied to clipboard");
+    };
+    fileListAndLogComponent.onClearAll = [this]()
+    {
+        clearFiles();
+        fileListAndLogComponent.updateFromState();
     };
 
     // CRITICAL: Wire up device reconfiguration callback for sample rate/buffer changes
@@ -332,8 +343,82 @@ void MainComponent::getNextAudioBlock(const juce::AudioSourceChannelInfo& buffer
     {
         // ================================================================
         // PREVIEW MODE: Play selected files (no recording)
-        // TODO: Implement preview playback
+        // Routes audio through selected OUTPUT channels only
         // ================================================================
+
+        if (numChannels >= 2 && appState.hasOutputPair)
+        {
+            // Output channels are always sequential starting from 0
+            int leftCh = 0;
+            int rightCh = 1;
+
+            // Check if we're in a gap between files
+            if (isInPreviewGap)
+            {
+                // Play silence during gap
+                int samplesToSilence = (int)juce::jmin((juce::int64)numSamples, previewGapSamplesRemaining);
+                previewGapSamplesRemaining -= samplesToSilence;
+
+                if (previewGapSamplesRemaining <= 0)
+                {
+                    // Gap finished - load next file
+                    isInPreviewGap = false;
+                    needsToLoadNextFile = true;
+                }
+                // Output already cleared, so we're outputting silence
+            }
+            else
+            {
+                // Play current file
+                const int totalSamples = appState.currentPlaybackBuffer.getNumSamples();
+                
+                if (playbackSamplePosition < totalSamples)
+                {
+                    // Calculate how many samples we can play in this buffer
+                    int samplesToPlay = juce::jmin(numSamples, (int)(totalSamples - playbackSamplePosition));
+
+                    // Copy audio to output channels
+                    float* leftOut = bufferToFill.buffer->getWritePointer(leftCh, bufferToFill.startSample);
+                    float* rightOut = bufferToFill.buffer->getWritePointer(rightCh, bufferToFill.startSample);
+
+                    const float* leftSrc = appState.currentPlaybackBuffer.getReadPointer(0, (int)playbackSamplePosition);
+                    const float* rightSrc = appState.currentPlaybackBuffer.getReadPointer(1, (int)playbackSamplePosition);
+
+                    // Copy samples
+                    for (int i = 0; i < samplesToPlay; ++i)
+                    {
+                        leftOut[i] = leftSrc[i];
+                        rightOut[i] = rightSrc[i];
+                    }
+
+                    playbackSamplePosition += samplesToPlay;
+
+                    // Check if file finished
+                    if (playbackSamplePosition >= totalSamples)
+                    {
+                        // File finished - start gap before next file
+                        playbackSamplePosition = 0;
+                        isInPreviewGap = true;
+                        
+                        // Calculate gap in samples
+                        previewGapSamplesRemaining = (juce::int64)((appState.settings.silenceBetweenFilesMs / 1000.0) * 
+                                                                   appState.settings.sampleRate);
+                        
+                        // If no gap, load next file immediately
+                        if (previewGapSamplesRemaining <= 0)
+                        {
+                            isInPreviewGap = false;
+                            needsToLoadNextFile = true;
+                        }
+                    }
+                }
+                else
+                {
+                    // Buffer position is invalid - stop preview
+                    appState.isPreviewing = false;
+                }
+            }
+        }
     }
 }
 
@@ -414,50 +499,24 @@ void MainComponent::timerCallback()
         if (appState.currentPreviewFileIndex < appState.previewPlaylist.size())
         {
             // Load next preview file
-            // Find file by ID
-            for (int i = 0; i < appState.files.size(); ++i)
+            if (loadNextFileForPreview())
             {
-                if (appState.files[i].id == appState.previewPlaylist[appState.currentPreviewFileIndex])
-                {
-                    // Load this file
-                    auto reader = formatManager.createReaderFor(appState.files[i].url);
-                    if (reader != nullptr)
-                    {
-                        // --- THIS IS THE NEW, CORRECTED CODE ---
-                        
-                        // 1. Set our playback buffer to be STEREO and the correct length.
-                        appState.currentPlaybackBuffer.setSize(2, (int)reader->lengthInSamples);
-                        appState.currentPlaybackBuffer.clear();
-
-                        // 2. Read the file into the stereo buffer.
-                        //    If the file is mono, reader->read() will correctly copy it to both L/R channels.
-                        //    If the file is stereo, it will copy L->L and R->R.
-                        reader->read(&appState.currentPlaybackBuffer,    // dest buffer
-                                     0,                                // dest start sample
-                                     (int)reader->lengthInSamples,     // num samples
-                                     0,                                // file start sample
-                                     true,                             // use L channel
-                                     true);                            // use R channel
-                        
-                        // --- END OF NEW CODE ---
-                        delete reader;
-
-                        playbackSamplePosition = 0;
-                        appState.isPreviewing = true;
-
-                        // Add silence delay
-                        juce::Thread::sleep(appState.settings.silenceBetweenFilesMs);
-                    }
-                    break;
-                }
+                playbackSamplePosition = 0;
+                isInPreviewGap = false;  // Reset gap flag
+                appState.isPreviewing = true;
+            }
+            else
+            {
+                // Failed to load - skip to next
+                needsToLoadNextFile = true;
             }
         }
         else
         {
-            // Preview finished
-            appState.isPreviewing = false;
-            appState.currentPreviewFileIndex = -1;
-            appState.appendLog("Preview complete");
+            // All files played - loop back to start (Round Robin)
+            appState.currentPreviewFileIndex = -1;  // Will be incremented to 0
+            needsToLoadNextFile = true;  // Load first file again
+            appState.appendLog("Preview looping...");
         }
     }
 
@@ -869,6 +928,13 @@ void MainComponent::startLatencyMeasurement()
 
 void MainComponent::startPreview()
 {
+    // Check if we have output configured
+    if (!appState.hasOutputPair)
+    {
+        appState.appendLog("Error: Please select an output device first");
+        return;
+    }
+
     // Build playlist from selected files
     appState.previewPlaylist.clear();
     for (const auto& file : appState.files)
@@ -885,9 +951,16 @@ void MainComponent::startPreview()
         return;
     }
 
-    appState.currentPreviewFileIndex = 0;
-    needsToLoadNextFile = true; // Trigger first file load
-    appState.appendLog("Preview started with " + juce::String(appState.previewPlaylist.size()) + " files");
+    // Initialize preview state
+    appState.currentPreviewFileIndex = -1;  // Will be incremented to 0 in timerCallback
+    playbackSamplePosition = 0;
+    isInPreviewGap = false;
+    previewGapSamplesRemaining = 0;
+    
+    // Trigger first file load on message thread
+    needsToLoadNextFile = true;
+    
+    appState.appendLog("Preview started with " + juce::String(appState.previewPlaylist.size()) + " file(s)");
 }
 
 void MainComponent::stopPreview()
@@ -895,7 +968,14 @@ void MainComponent::stopPreview()
     appState.isPreviewing = false;
     appState.previewPlaylist.clear();
     appState.currentPreviewFileIndex = -1;
+    playbackSamplePosition = 0;
+    isInPreviewGap = false;
+    previewGapSamplesRemaining = 0;
+    needsToLoadNextFile = false;  // Cancel any pending file loads
     appState.appendLog("Preview stopped");
+    
+    // Update UI to reflect stopped state
+    fileListAndLogComponent.updateFromState();
 }
 
 void MainComponent::startHardwareTest()
@@ -962,6 +1042,66 @@ bool MainComponent::loadNextFileForProcessing()
     file.status = ProcessingStatus::processing;
     appState.currentProcessingFile = file.getFileName();
     appState.appendLog("Processing: " + file.getFileName());
+
+    return true;
+}
+
+bool MainComponent::loadNextFileForPreview()
+{
+    // Get the file ID from the preview playlist
+    if (!juce::isPositiveAndBelow(appState.currentPreviewFileIndex, appState.previewPlaylist.size()))
+        return false;
+
+    juce::String fileID = appState.previewPlaylist[appState.currentPreviewFileIndex];
+
+    // Find the file by ID in the main file list
+    AudioFile* fileToPreview = nullptr;
+    for (auto& file : appState.files)
+    {
+        if (file.id == fileID)
+        {
+            fileToPreview = &file;
+            break;
+        }
+    }
+
+    if (fileToPreview == nullptr)
+    {
+        appState.appendLog("Error: Preview file not found - " + fileID);
+        return false;
+    }
+
+    if (!fileToPreview->isValid())
+    {
+        appState.appendLog("Skipping invalid preview file: " + fileToPreview->getFileName());
+        return false;
+    }
+
+    // Load the audio file
+    auto* reader = formatManager.createReaderFor(fileToPreview->url);
+    if (reader == nullptr)
+    {
+        appState.appendLog("Error: Could not read preview file - " + fileToPreview->getFileName());
+        return false;
+    }
+
+    // Set playback buffer to stereo and the correct length
+    appState.currentPlaybackBuffer.setSize(2, (int)reader->lengthInSamples);
+    appState.currentPlaybackBuffer.clear();
+
+    // Read the file into the stereo buffer
+    // If the file is mono, reader->read() will correctly copy it to both L/R channels
+    // If the file is stereo, it will copy L->L and R->R
+    reader->read(&appState.currentPlaybackBuffer,
+                 0,
+                 (int)reader->lengthInSamples,
+                 0,
+                 true,  // use L channel
+                 true); // use R channel
+
+    delete reader;
+
+    appState.appendLog("Preview: " + fileToPreview->getFileName());
 
     return true;
 }

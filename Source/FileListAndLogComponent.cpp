@@ -36,6 +36,11 @@ FileListAndLogComponent::FileListAndLogComponent(AppState& state)
     selectAllButton.addListener(this);
     addAndMakeVisible(selectAllButton);
 
+    // Clear All button
+    clearAllButton.setButtonText("Clear All");
+    clearAllButton.addListener(this);
+    addAndMakeVisible(clearAllButton);
+
     // Preview button
     previewButton.setButtonText(makeUTF8("\xE2\x96\xB6 Preview Selected"));
     previewButton.addListener(this);
@@ -119,23 +124,31 @@ void FileListAndLogComponent::resized()
     // Show/hide components based on whether files exist
     if (appState.files.isEmpty())
     {
+        // Show drag-and-drop area only
         fileListBox.setVisible(false);
         selectAllButton.setVisible(false);
+        clearAllButton.setVisible(false);
         fileCountLabel.setVisible(true);
         fileCountLabel.setBounds(dropZoneBounds.withSizeKeepingCentre(300, 40));
     }
     else
     {
+        // Show file list area only (no drag-and-drop overlay)
         fileListBox.setVisible(true);
         selectAllButton.setVisible(true);
+        clearAllButton.setVisible(true);
         fileCountLabel.setVisible(false);
 
-        // File list header with "Select All" button
+        // File list header with buttons
         auto fileListArea = fileAreaBounds.reduced(10);
         auto headerArea = fileListArea.removeFromTop(30);
+        
+        // Buttons on the right side of header
+        clearAllButton.setBounds(headerArea.removeFromRight(80).reduced(2));
+        headerArea.removeFromRight(5);  // Small gap
         selectAllButton.setBounds(headerArea.removeFromRight(100).reduced(2));
 
-        // File list box - IMPORTANT: Set intercepts mouse clicks to false so parent can handle double-clicks
+        // File list box
         fileListBox.setBounds(fileListArea);
     }
 
@@ -201,6 +214,8 @@ void FileListAndLogComponent::buttonClicked(juce::Button* button)
 {
     if (button == &previewButton)
     {
+        // The onPreviewClicked callback will handle both start and stop
+        // MainComponent will check isPreviewing state and act accordingly
         if (onPreviewClicked)
             onPreviewClicked();
     }
@@ -240,15 +255,25 @@ void FileListAndLogComponent::buttonClicked(juce::Button* button)
         fileListBox.updateContent();
         fileListBox.repaint();
     }
+    else if (button == &clearAllButton)
+    {
+        // Clear all files and return to drag-and-drop mode
+        if (onClearAll)
+            onClearAll();
+    }
 }
 
 bool FileListAndLogComponent::isInterestedInFileDrag(const juce::StringArray& files)
 {
-    // Accept audio files
+    // Accept audio files - check all files
     for (const auto& file : files)
     {
-        if (file.endsWith(".wav") || file.endsWith(".aif") || file.endsWith(".aiff"))
+        if (file.endsWithIgnoreCase(".wav") || 
+            file.endsWithIgnoreCase(".aif") || 
+            file.endsWithIgnoreCase(".aiff"))
+        {
             return true;
+        }
     }
     return false;
 }
@@ -275,13 +300,13 @@ void FileListAndLogComponent::filesDropped(const juce::StringArray& files, int x
     repaint();
 }
 
-void FileListAndLogComponent::fileDragEnter(const juce::StringArray&, int, int)
+void FileListAndLogComponent::fileDragEnter(const juce::StringArray& files, int x, int y)
 {
     isDraggingOver = true;
     repaint();
 }
 
-void FileListAndLogComponent::fileDragExit(const juce::StringArray&)
+void FileListAndLogComponent::fileDragExit(const juce::StringArray& files)
 {
     isDraggingOver = false;
     repaint();
@@ -430,9 +455,19 @@ void FileListAndLogComponent::updateFromState()
     logDisplay.setText(logText, false);
     logDisplay.moveCaretToEnd();
 
-    // Update button states
-    previewButton.setEnabled(!appState.files.isEmpty() && !appState.isProcessing);
-    processAllButton.setEnabled(!appState.files.isEmpty() && !appState.isProcessing);
+    // Update button states and text
+    if (appState.isPreviewing)
+    {
+        previewButton.setButtonText(makeUTF8("\xE2\x96\xA0 Stop Preview"));  // ■ Stop Preview
+        previewButton.setEnabled(true);
+    }
+    else
+    {
+        previewButton.setButtonText(makeUTF8("\xE2\x96\xB6 Preview Selected"));  // ▶ Preview Selected
+        previewButton.setEnabled(!appState.files.isEmpty() && !appState.isProcessing);
+    }
+    
+    processAllButton.setEnabled(!appState.files.isEmpty() && !appState.isProcessing && !appState.isPreviewing);
 
     resized();  // Trigger layout update
     repaint();
@@ -440,7 +475,7 @@ void FileListAndLogComponent::updateFromState()
 
 void FileListAndLogComponent::drawDropZone(juce::Graphics& g, juce::Rectangle<int> bounds)
 {
-    // Dashed border like original
+    // Dashed border
     g.setColour(isDraggingOver ? juce::Colour(0xff007aff) : juce::Colour(0xffc7c7cc));
 
     // Draw dashed rectangle
@@ -471,25 +506,35 @@ void FileListAndLogComponent::drawDropZone(juce::Graphics& g, juce::Rectangle<in
 
     g.fillPath(dashedPath);
 
-    // Draw icon and text
-    auto centerBounds = bounds.withSizeKeepingCentre(240, 120);
-
-    // Document icon
-    juce::Path docIcon;
-    auto iconBounds = centerBounds.removeFromTop(50).withSizeKeepingCentre(40, 50);
-    docIcon.addRoundedRectangle(iconBounds.toFloat(), 4.0f);
-    g.setColour(juce::Colour(0xffc7c7cc));
-    g.fillPath(docIcon);
-
-    // Text - primary instruction
+    // Draw large down arrow in center
+    auto centerBounds = bounds.withSizeKeepingCentre(100, 100);
+    
+    juce::Path arrowPath;
+    float arrowWidth = 60.0f;
+    float arrowHeight = 70.0f;
+    float centerX = centerBounds.getCentreX();
+    float centerY = centerBounds.getCentreY();
+    
+    // Arrow shaft (rectangle at top)
+    float shaftWidth = 20.0f;
+    float shaftHeight = 35.0f;
+    arrowPath.addRectangle(centerX - shaftWidth / 2, centerY - arrowHeight / 2, 
+                          shaftWidth, shaftHeight);
+    
+    // Arrow head (triangle at bottom)
+    float headTop = centerY - arrowHeight / 2 + shaftHeight;
+    arrowPath.addTriangle(centerX - arrowWidth / 2, headTop,  // Left point
+                         centerX + arrowWidth / 2, headTop,  // Right point
+                         centerX, centerY + arrowHeight / 2); // Bottom point
+    
+    g.setColour(isDraggingOver ? juce::Colour(0xff007aff).withAlpha(0.4f) : juce::Colour(0xffc7c7cc).withAlpha(0.5f));
+    g.fillPath(arrowPath);
+    
+    // Simple text below arrow
     g.setColour(juce::Colour(0xff86868b));
     g.setFont(makeFont(14.0f));
-    g.drawText("Drag audio files here", centerBounds.removeFromTop(25), juce::Justification::centred);
-
-    // Text - secondary instruction
-    centerBounds.removeFromTop(5);  // Small gap
-    g.setFont(makeFont(12.0f));
-    g.setColour(juce::Colour(0xffb0b0b5));
-    g.drawText("or double-click to browse", centerBounds.removeFromTop(20), juce::Justification::centred);
+    auto textBounds = bounds.withSizeKeepingCentre(300, 30);
+    textBounds.translate(0, 80);  // Move below arrow
+    g.drawText("Drop audio files here", textBounds, juce::Justification::centred);
 }
 

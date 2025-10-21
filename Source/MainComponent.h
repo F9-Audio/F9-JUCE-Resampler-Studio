@@ -179,6 +179,10 @@ private:
     float sinePhase = 0.0f;
     float sineFrequency = 1000.0f; // 1kHz test tone
 
+    // Preview state
+    juce::int64 previewGapSamplesRemaining = 0;  // Silence gap between preview files
+    bool isInPreviewGap = false;  // True when playing silence between files
+
     // File saving state (triggered by audio thread, processed by timer)
     bool needsToSaveCurrentFile = false;
     bool needsToLoadNextFile = false;
@@ -211,6 +215,9 @@ private:
 
     /** Load next file from queue into playback buffer */
     bool loadNextFileForProcessing();
+
+    /** Load next file for preview playback */
+    bool loadNextFileForPreview();
 
     /** Save the current recording buffer to file */
     void saveCurrentRecording();
