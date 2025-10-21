@@ -12,6 +12,19 @@ MainComponent::MainComponent()
     // Register audio formats
     formatManager.registerBasicFormats();
 
+    // Request microphone permissions on macOS
+    appState.appendLog("Requesting microphone permissions...");
+    juce::RuntimePermissions::request(
+        juce::RuntimePermissions::recordAudio,
+        [this](bool granted)
+        {
+            if (granted)
+                appState.appendLog("Microphone access GRANTED");
+            else
+                appState.appendLog("ERROR: Microphone access DENIED - please enable in System Settings");
+        }
+    );
+
     // Initialize audio system with basic stereo I/O
     // setAudioChannels will set up deviceManager
     setAudioChannels(2, 2);  // 2 inputs, 2 outputs
@@ -139,15 +152,6 @@ void MainComponent::handleAudioCallback(const float* const* inputChannelData,
     // RAW AUDIO CALLBACK - We get both input and output here!
     // ============================================================================
 
-    // DEBUG: Log first few callbacks to verify it's being called
-    static int callbackCount = 0;
-    if (callbackCount < 3)
-    {
-        DBG("CustomCallback called: " + juce::String(numInputChannels) + " in, " +
-            juce::String(numOutputChannels) + " out, " + juce::String(numSamples) + " samples");
-        callbackCount++;
-    }
-
     // First, copy input to our input buffer for processing
     if (numInputChannels > 0 && inputChannelData != nullptr)
     {
@@ -187,24 +191,8 @@ void MainComponent::getNextAudioBlock(const juce::AudioSourceChannelInfo& buffer
     const int numSamples = bufferToFill.numSamples;
     const int numChannels = bufferToFill.buffer->getNumChannels();
 
-    // CRITICAL: Capture input audio FIRST before processing
-    auto* device = deviceManager.getCurrentAudioDevice();
-    if (device != nullptr)
-    {
-        // Get input from device callback
-        auto activeInputChannels = device->getActiveInputChannels();
-        int numInputChannels = activeInputChannels.countNumberOfSetBits();
-
-        if (numInputChannels > 0)
-        {
-            // Copy input data to our input buffer for processing
-            inputBuffer.setSize(numInputChannels, numSamples, false, false, true);
-
-            // JUCE provides input in bufferToFill when AudioAppComponent is used
-            // We need to get it from the AudioDeviceManager's callback
-            // For now, we'll handle this in the specific modes below
-        }
-    }
+    // NOTE: Input audio is captured by our CustomAudioCallback in handleAudioCallback()
+    // The inputBuffer is already populated before this function is called
 
     // Clear all outputs by default
     bufferToFill.clearActiveBufferRegion();
@@ -249,19 +237,6 @@ void MainComponent::getNextAudioBlock(const juce::AudioSourceChannelInfo& buffer
             // Capture input and look for impulse return
             // IMPORTANT: inputBuffer contains only the ACTIVE channels in sequential order (0, 1, 2...)
             // NOT the physical channel numbers. If we enabled channels 3-4, they appear as indices 0-1.
-
-            // DEBUG: Log input buffer status
-            static int debugCount = 0;
-            if (debugCount < 3)
-            {
-                DBG("Latency capture: inputBuffer has " + juce::String(inputBuffer.getNumChannels()) + " channels");
-                if (inputBuffer.getNumChannels() > 0)
-                {
-                    float maxLevel = inputBuffer.getMagnitude(0, numSamples);
-                    DBG("Input level: " + juce::String(maxLevel));
-                }
-                debugCount++;
-            }
 
             if (inputBuffer.getNumChannels() >= 2 && appState.hasInputPair)
             {
@@ -715,10 +690,6 @@ void MainComponent::configureAudioDevice()
                          ", " + juce::String(appState.selectedOutputPair.rightChannel));
     }
 
-    // DEBUG: Log what we're requesting
-    appState.appendLog("Requesting input channels: " + setup.inputChannels.toString(2));
-    appState.appendLog("Requesting output channels: " + setup.outputChannels.toString(2));
-
     // Apply the setup - this will reconfigure the already-running audio system
     juce::String error = deviceManager.setAudioDeviceSetup(setup, true);
 
@@ -730,13 +701,6 @@ void MainComponent::configureAudioDevice()
 
     // Verify the device was opened correctly
     auto* device = deviceManager.getCurrentAudioDevice();
-
-    // DEBUG: Log what was actually enabled
-    if (device != nullptr)
-    {
-        appState.appendLog("Active input channels: " + device->getActiveInputChannels().toString(2));
-        appState.appendLog("Active output channels: " + device->getActiveOutputChannels().toString(2));
-    }
     if (device == nullptr)
     {
         appState.appendLog("Error: Device failed to open");
@@ -761,17 +725,12 @@ void MainComponent::configureAudioDevice()
     appState.settings.measuredLatencySamples = -1;
     appState.settings.hasNoiseFloorMeasurement = false;
 
-    // Apply device setup
-    juce::String error2 = deviceManager.setAudioDeviceSetup(setup, true);
+    // IMPORTANT: Re-register our custom callback after device reconfiguration
+    // The device reconfiguration may have cleared callbacks
+    deviceManager.removeAudioCallback(&customCallback);
+    deviceManager.addAudioCallback(&customCallback);
 
-    if (!error2.isEmpty())
-    {
-        appState.appendLog("Error applying device setup: " + error2);
-    }
-    else
-    {
-        appState.appendLog("Device configured successfully");
-    }
+    appState.appendLog("Device configured successfully");
 }
 
 //==============================================================================

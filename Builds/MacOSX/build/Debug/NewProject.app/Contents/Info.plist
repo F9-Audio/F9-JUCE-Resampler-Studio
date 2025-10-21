@@ -5,13 +5,13 @@
 	<key>BuildMachineOSBuild</key>
 	<string>23H730</string>
 	<key>CFBundleDisplayName</key>
-	<string>NewProject</string>
+	<string>F9 Batch Resampler</string>
 	<key>CFBundleExecutable</key>
 	<string>NewProject</string>
 	<key>CFBundleIdentifier</key>
-	<string>com.yourcompany.NewProject</string>
+	<string>com.f9audio.BatchResampler</string>
 	<key>CFBundleName</key>
-	<string>NewProject</string>
+	<string>F9 Batch Resampler</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
@@ -44,5 +44,7 @@
 	<string>10.13</string>
 	<key>NSHighResolutionCapable</key>
 	<true/>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>F9 Batch Resampler needs microphone access to capture audio from your interface for processing.</string>
 </dict>
 </plist>

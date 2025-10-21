@@ -12,6 +12,45 @@
 - ✅ Modern lambda-based file choosers with `launchAsync()`
 - ⚠️ Check JUCE 8.x docs for any API changes before implementation
 
+## ⚠️ CRITICAL: macOS Microphone Permissions
+
+**PROBLEM:** On macOS 10.14+, apps MUST request microphone permission or audio input will be SILENT (all zeros).
+
+**SOLUTION - 3 Required Steps:**
+
+### 1. Projucer Configuration (.jucer file)
+```xml
+<XCODE_MAC targetFolder="Builds/MacOSX"
+           microphonePermissionNeeded="1"
+           microphonePermissionsText="App needs microphone access to capture audio."
+           bundleIdentifier="com.yourcompany.YourApp"
+           version="1.0.0">
+```
+
+### 2. Runtime Permission Request (in constructor/startup)
+```cpp
+juce::RuntimePermissions::request(
+    juce::RuntimePermissions::recordAudio,
+    [this](bool granted)
+    {
+        if (granted)
+            DBG("Microphone access GRANTED");
+        else
+            DBG("Microphone access DENIED");
+    }
+);
+```
+
+### 3. Testing Permission Changes
+- Changing bundle identifier forces macOS to treat app as "new" → prompts for permission again
+- Delete app from `/System/Settings/Privacy & Security/Microphone` to reset
+- Clean build folder and rebuild after Projucer regeneration
+
+**Symptoms of Missing Permission:**
+- `inputBuffer` receives all zeros even when hardware is working
+- `numInputChannels` is correct but `inputChannelData[ch][i]` = 0.0
+- Hardware test shows output but latency measurement fails (no input detected)
+
 ## Project Overview
 
 **Original:** Swift/macOS - **Target:** JUCE/C++ (Cross-platform)
