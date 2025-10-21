@@ -39,6 +39,8 @@ public:
      * Real-time audio callback - THE CORE STATE MACHINE
      * Routes audio processing based on AppState flags
      * CRITICAL: Must be fast and lock-free!
+     *
+     * NOTE: We access the AudioDeviceManager directly to get separate input buffers
      */
     void getNextAudioBlock (const juce::AudioSourceChannelInfo& bufferToFill) override;
 
@@ -155,6 +157,9 @@ private:
     bool needsToSaveCurrentFile = false;
     bool needsToLoadNextFile = false;
     bool needsToCompleteLatencyMeasurement = false;
+
+    // Input buffer for capturing hardware inputs
+    juce::AudioBuffer<float> inputBuffer;
 
     //==============================================================================
     // Helper Methods - Device Management
