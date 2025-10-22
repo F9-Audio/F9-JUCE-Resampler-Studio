@@ -183,9 +183,15 @@ private:
     juce::int64 previewGapSamplesRemaining = 0;  // Silence gap between preview files
     bool isInPreviewGap = false;  // True when playing silence between files
 
+    // Processing state
+    juce::int64 processingGapSamplesRemaining = 0;  // Silence gap between processed files
+    bool isInProcessingGap = false;  // True when playing silence between files during processing
+    juce::int64 targetRecordingSamples = 0;  // How many samples we need to record (including latency buffer)
+
     // File saving state (triggered by audio thread, processed by timer)
     bool needsToSaveCurrentFile = false;
     bool needsToLoadNextFile = false;
+    bool needsToLoadNextProcessingFile = false;
     bool needsToCompleteLatencyMeasurement = false;
 
     // Input buffer for capturing hardware inputs
@@ -213,11 +219,14 @@ private:
     //==============================================================================
     // Helper Methods - File Processing
 
-    /** Load next file from queue into playback buffer */
+    /** Load next file from queue into playback buffer for processing */
     bool loadNextFileForProcessing();
 
     /** Load next file for preview playback */
     bool loadNextFileForPreview();
+    
+    /** Validate output folder is safe (not same as source folder) */
+    bool validateOutputFolder();
 
     /** Save the current recording buffer to file */
     void saveCurrentRecording();

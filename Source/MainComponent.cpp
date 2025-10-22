@@ -273,7 +273,9 @@ void MainComponent::getNextAudioBlock(const juce::AudioSourceChannelInfo& buffer
                 if (peakPosition >= 0)
                 {
                     // Found the impulse return! Calculate latency
-                    appState.settings.measuredLatencySamples = peakPosition;
+                    // peakPosition is in frames, convert to interleaved samples for consistency with Swift
+                    int numChannels = appState.latencyCaptureBuffer.getNumChannels();
+                    appState.settings.measuredLatencySamples = peakPosition * numChannels;
                     appState.settings.lastBufferSizeWhenMeasured = appState.settings.bufferSize;
                     needsToCompleteLatencyMeasurement = true;
                     appState.isMeasuringLatency = false;
@@ -336,8 +338,113 @@ void MainComponent::getNextAudioBlock(const juce::AudioSourceChannelInfo& buffer
     {
         // ================================================================
         // PROCESSING MODE: Play file through output, record from input
-        // TODO: Implement file processing
+        // Uses selected input AND output pairs with latency compensation
         // ================================================================
+
+        // Check if we have enough input and output channels
+        int numInputChannels = inputBuffer.getNumChannels();
+        
+        if (numChannels >= 2 && numInputChannels >= 2 && 
+            appState.hasOutputPair && appState.hasInputPair)
+        {
+            // Output and input channels are sequential starting from 0
+            int leftOutCh = 0;
+            int rightOutCh = 1;
+            int leftInCh = 0;
+            int rightInCh = 1;
+
+            // Check if we're in a gap between files
+            if (isInProcessingGap)
+            {
+                // Play silence during gap
+                int samplesToSilence = (int)juce::jmin((juce::int64)numSamples, processingGapSamplesRemaining);
+                processingGapSamplesRemaining -= samplesToSilence;
+
+                // Still record during gap (captures any residual tail)
+                if (recordingSamplePosition < appState.recordingBuffer.getNumSamples())
+                {
+                    int samplesToRecord = juce::jmin(numSamples, 
+                                                     appState.recordingBuffer.getNumSamples() - (int)recordingSamplePosition);
+                    
+                    if (samplesToRecord > 0 && inputBuffer.getNumChannels() >= 2)
+                    {
+                        appState.recordingBuffer.copyFrom(0, (int)recordingSamplePosition, 
+                                                         inputBuffer, leftInCh, 0, samplesToRecord);
+                        appState.recordingBuffer.copyFrom(1, (int)recordingSamplePosition, 
+                                                         inputBuffer, rightInCh, 0, samplesToRecord);
+                        recordingSamplePosition += samplesToRecord;
+                    }
+                }
+
+                if (processingGapSamplesRemaining <= 0)
+                {
+                    // Gap finished - trigger save and load next file
+                    isInProcessingGap = false;
+                    needsToSaveCurrentFile = true;
+                }
+            }
+            else
+            {
+                // Play current file AND record input simultaneously
+                const int totalPlaybackSamples = appState.currentPlaybackBuffer.getNumSamples();
+                
+                // PLAYBACK: Send audio to output
+                if (playbackSamplePosition < totalPlaybackSamples)
+                {
+                    int samplesToPlay = juce::jmin(numSamples, (int)(totalPlaybackSamples - playbackSamplePosition));
+
+                    float* leftOut = bufferToFill.buffer->getWritePointer(leftOutCh, bufferToFill.startSample);
+                    float* rightOut = bufferToFill.buffer->getWritePointer(rightOutCh, bufferToFill.startSample);
+
+                    const float* leftSrc = appState.currentPlaybackBuffer.getReadPointer(0, (int)playbackSamplePosition);
+                    const float* rightSrc = appState.currentPlaybackBuffer.getReadPointer(1, (int)playbackSamplePosition);
+
+                    for (int i = 0; i < samplesToPlay; ++i)
+                    {
+                        leftOut[i] = leftSrc[i];
+                        rightOut[i] = rightSrc[i];
+                    }
+
+                    playbackSamplePosition += samplesToPlay;
+                }
+
+                // RECORDING: Capture input
+                if (recordingSamplePosition < appState.recordingBuffer.getNumSamples())
+                {
+                    int samplesToRecord = juce::jmin(numSamples, 
+                                                     appState.recordingBuffer.getNumSamples() - (int)recordingSamplePosition);
+                    
+                    if (samplesToRecord > 0 && inputBuffer.getNumChannels() >= 2)
+                    {
+                        appState.recordingBuffer.copyFrom(0, (int)recordingSamplePosition, 
+                                                         inputBuffer, leftInCh, 0, samplesToRecord);
+                        appState.recordingBuffer.copyFrom(1, (int)recordingSamplePosition, 
+                                                         inputBuffer, rightInCh, 0, samplesToRecord);
+                        recordingSamplePosition += samplesToRecord;
+                    }
+                }
+
+                // Check if we've captured enough (reached target including latency buffer)
+                if (recordingSamplePosition >= targetRecordingSamples)
+                {
+                    // File finished - start gap before saving
+                    playbackSamplePosition = 0;
+                    recordingSamplePosition = 0;
+                    isInProcessingGap = true;
+                    
+                    // Calculate gap in samples
+                    processingGapSamplesRemaining = (juce::int64)((appState.settings.silenceBetweenFilesMs / 1000.0) * 
+                                                                  appState.settings.sampleRate);
+                    
+                    // If no gap, save immediately
+                    if (processingGapSamplesRemaining <= 0)
+                    {
+                        isInProcessingGap = false;
+                        needsToSaveCurrentFile = true;
+                    }
+                }
+            }
+        }
     }
     else if (appState.isPreviewing)
     {
@@ -462,31 +569,62 @@ void MainComponent::timerCallback()
     if (needsToSaveCurrentFile)
     {
         needsToSaveCurrentFile = false;
+        
+        // Save the current recording
         saveCurrentRecording();
 
         // Move to next file or finish
         appState.currentFileIndex++;
+        
+        // Update progress
+        if (appState.files.size() > 0)
+        {
+            appState.processingProgress = (double)appState.currentFileIndex / appState.files.size();
+        }
+
         if (appState.currentFileIndex < appState.files.size())
         {
-            // Load next file
-            if (loadNextFileForProcessing())
+            // Try to load next file
+            bool loadedSuccessfully = loadNextFileForProcessing();
+            
+            if (loadedSuccessfully)
             {
                 // Reset for next file
                 playbackSamplePosition = 0;
                 recordingSamplePosition = 0;
-                appState.recordingBuffer.clear();
+                isInProcessingGap = false;
+                processingGapSamplesRemaining = 0;
                 appState.isProcessing = true;
-
-                // Add silence delay
-                juce::Thread::sleep(appState.settings.silenceBetweenFilesMs);
+            }
+            else
+            {
+                // File failed to load - skip it and try next one
+                appState.appendLog("Skipping to next file...");
+                needsToSaveCurrentFile = true;  // Trigger loading of next file
             }
         }
         else
         {
             // All files processed
-            appState.appendLog("Batch processing complete");
-            appState.currentFileIndex = 0;
-            appState.processingProgress = 0.0;
+            appState.isProcessing = false;
+            appState.processingProgress = 1.0;
+            
+            // Count successes and failures
+            int completed = 0, failed = 0;
+            for (const auto& file : appState.files)
+            {
+                if (file.status == ProcessingStatus::completed)
+                    completed++;
+                else if (file.status == ProcessingStatus::failed)
+                    failed++;
+            }
+            
+            appState.appendLog("================================");
+            appState.appendLog("Batch processing COMPLETE");
+            appState.appendLog("  Successful: " + juce::String(completed) + " file(s)");
+            if (failed > 0)
+                appState.appendLog("  Failed: " + juce::String(failed) + " file(s)");
+            appState.appendLog("================================");
         }
     }
 
@@ -857,6 +995,7 @@ void MainComponent::toggleFileSelection(int fileIndex)
 
 void MainComponent::startProcessing()
 {
+    // Validation checks
     if (!appState.canMeasureLatency())
     {
         appState.appendLog("Error: Please select input and output devices first");
@@ -881,10 +1020,20 @@ void MainComponent::startProcessing()
         return;
     }
 
-    // Start processing
+    // Validate output folder
+    if (!validateOutputFolder())
+    {
+        return;  // Error message logged in validateOutputFolder()
+    }
+
+    // Initialize processing state
     appState.currentFileIndex = 0;
     appState.isProcessing = false; // Will be set to true after first file loads
+    appState.processingProgress = 0.0;
+    isInProcessingGap = false;
+    processingGapSamplesRemaining = 0;
 
+    // Load first file and start processing
     if (loadNextFileForProcessing())
     {
         playbackSamplePosition = 0;
@@ -893,7 +1042,7 @@ void MainComponent::startProcessing()
         appState.isProcessing = true;
 
         appState.appendLog("Starting batch processing of " +
-                         juce::String(appState.files.size()) + " files");
+                         juce::String(appState.files.size()) + " file(s)");
     }
 }
 
@@ -1010,6 +1159,7 @@ bool MainComponent::loadNextFileForProcessing()
     if (!file.isValid())
     {
         appState.appendLog("Skipping invalid file: " + file.getFileName());
+        file.status = ProcessingStatus::failed;
         return false;
     }
 
@@ -1017,31 +1167,41 @@ bool MainComponent::loadNextFileForProcessing()
     if (reader == nullptr)
     {
         appState.appendLog("Error: Could not read file - " + file.getFileName());
+        file.status = ProcessingStatus::failed;
         return false;
     }
 
-    // --- THIS IS THE NEW, CORRECTED CODE ---
+    // Get source file length
+    int sourceFrames = (int)reader->lengthInSamples;
     
-    // 1. Set our playback buffer to be STEREO and the correct length.
-    appState.currentPlaybackBuffer.setSize(2, (int)reader->lengthInSamples);
+    // Load file into playback buffer (stereo)
+    appState.currentPlaybackBuffer.setSize(2, sourceFrames);
     appState.currentPlaybackBuffer.clear();
-
-    // 2. Read the file into the stereo buffer.
-    //    If the file is mono, reader->read() will correctly copy it to both L/R channels.
-    //    If the file is stereo, it will copy L->L and R->R.
-    reader->read(&appState.currentPlaybackBuffer,    // dest buffer
-                 0,                                // dest start sample
-                 (int)reader->lengthInSamples,     // num samples
-                 0,                                // file start sample
-                 true,                             // use L channel
-                 true);                            // use R channel
-    
-    // --- END OF NEW CODE ---
+    reader->read(&appState.currentPlaybackBuffer, 0, sourceFrames, 0, true, true);
     delete reader;
 
+    // Calculate recording buffer size with latency compensation
+    // measuredLatencySamples is in interleaved samples, convert to frames
+    int inputChannelCount = 2;  // We're always recording stereo
+    int latencyFrames = appState.settings.measuredLatencySamples / inputChannelCount;
+    
+    // Formula: sourceFrames + latencyFrames + (latencyFrames * 4) for safety buffer
+    int recordingFrames = sourceFrames + latencyFrames + (latencyFrames * 4);
+    
+    // Allocate recording buffer
+    appState.recordingBuffer.setSize(inputChannelCount, recordingFrames);
+    appState.recordingBuffer.clear();
+    
+    // Set target recording length in frames
+    targetRecordingSamples = recordingFrames;
+    
     file.status = ProcessingStatus::processing;
     appState.currentProcessingFile = file.getFileName();
     appState.appendLog("Processing: " + file.getFileName());
+    appState.appendLog("  Source: " + juce::String(sourceFrames) + " frames");
+    appState.appendLog("  Latency: " + juce::String(latencyFrames) + " frames (" + 
+                      juce::String(appState.settings.measuredLatencySamples) + " interleaved samples)");
+    appState.appendLog("  Recording: " + juce::String(recordingFrames) + " frames (includes latency + safety buffer)");
 
     return true;
 }
@@ -1106,6 +1266,39 @@ bool MainComponent::loadNextFileForPreview()
     return true;
 }
 
+bool MainComponent::validateOutputFolder()
+{
+    juce::File outputFolder(appState.settings.outputFolderPath);
+    
+    // Check if output folder exists
+    if (!outputFolder.exists())
+    {
+        appState.appendLog("Error: Output folder does not exist: " + outputFolder.getFullPathName());
+        return false;
+    }
+    
+    // Check if output folder is writable
+    if (!outputFolder.hasWriteAccess())
+    {
+        appState.appendLog("Error: No write access to output folder: " + outputFolder.getFullPathName());
+        return false;
+    }
+    
+    // Check if any source file is in the same folder as output folder
+    for (const auto& file : appState.files)
+    {
+        if (file.url.getParentDirectory().getFullPathName() == outputFolder.getFullPathName())
+        {
+            appState.appendLog("ERROR: Output folder is same as source file folder!");
+            appState.appendLog("  This could overwrite your source files.");
+            appState.appendLog("  Please select a different output folder.");
+            return false;
+        }
+    }
+    
+    return true;
+}
+
 void MainComponent::saveCurrentRecording()
 {
     if (appState.currentFileIndex >= appState.files.size())
@@ -1113,21 +1306,59 @@ void MainComponent::saveCurrentRecording()
 
     AudioFile& sourceFile = appState.files.getReference(appState.currentFileIndex);
 
-    // Trim latency from recording
+    // Get original source length in frames
+    int originalLength = appState.currentPlaybackBuffer.getNumSamples();
+    
+    // Log the trimming parameters for debugging
+    appState.appendLog("  Trimming: RecordedFrames=" + juce::String(appState.recordingBuffer.getNumSamples()) +
+                      ", LatencyInterleaved=" + juce::String(appState.settings.measuredLatencySamples) +
+                      ", OriginalFrames=" + juce::String(originalLength));
+    
+    // Check recording buffer before trimming
+    float recordingMaxLevel = 0.0f;
+    for (int ch = 0; ch < appState.recordingBuffer.getNumChannels(); ++ch)
+    {
+        const float* data = appState.recordingBuffer.getReadPointer(ch);
+        for (int i = 0; i < appState.recordingBuffer.getNumSamples(); ++i)
+        {
+            recordingMaxLevel = juce::jmax(recordingMaxLevel, std::abs(data[i]));
+        }
+    }
+    DBG("Recording buffer max level: " << recordingMaxLevel);
+    
+    // Trim latency from recording (measuredLatencySamples is in interleaved samples)
     juce::AudioBuffer<float> trimmed = trimLatency(
         appState.recordingBuffer,
         appState.settings.measuredLatencySamples,
-        appState.currentPlaybackBuffer.getNumSamples()
+        originalLength
     );
-
-    // Apply DC removal if enabled
-    if (appState.settings.dcRemovalEnabled)
+    
+    // Check trimmed buffer
+    float trimmedMaxLevel = 0.0f;
+    for (int ch = 0; ch < trimmed.getNumChannels(); ++ch)
     {
-        removeDCOffset(trimmed);
+        const float* data = trimmed.getReadPointer(ch);
+        for (int i = 0; i < trimmed.getNumSamples(); ++i)
+        {
+            trimmedMaxLevel = juce::jmax(trimmedMaxLevel, std::abs(data[i]));
+        }
     }
+    DBG("Trimmed buffer max level: " << trimmedMaxLevel);
+
+    // Apply DC removal if enabled (commented out for now per user request #2)
+    // if (appState.settings.dcRemovalEnabled)
+    // {
+    //     removeDCOffset(trimmed);
+    // }
 
     // Generate output file path
     juce::File outputFile = generateOutputFile(sourceFile);
+
+    // Check if file already exists
+    if (outputFile.exists())
+    {
+        appState.appendLog("Warning: Overwriting existing file - " + outputFile.getFileName());
+    }
 
     // Write file
     std::unique_ptr<juce::OutputStream> fileStream(outputFile.createOutputStream());
@@ -1135,31 +1366,44 @@ void MainComponent::saveCurrentRecording()
     if (fileStream == nullptr)
     {
         sourceFile.status = ProcessingStatus::failed;
-        appState.appendLog("Error: Could not create output stream for file - " + outputFile.getFileName());
+        appState.appendLog("ERROR: Could not create output file - " + outputFile.getFileName());
         return;
     }
 
+    // Write as 24-bit WAV using JUCE 8 API
     juce::WavAudioFormat wavFormat;
-    auto writer = wavFormat.createWriterFor(
-        fileStream,
-        juce::AudioFormatWriter::Options{}
-            .withSampleRate(appState.settings.sampleRate)
-            .withNumChannels(trimmed.getNumChannels())
-            .withBitsPerSample(24)
+    
+    juce::AudioFormatWriter* rawWriter = wavFormat.createWriterFor(
+        fileStream.release(),  // OutputStream* - writer takes ownership
+        appState.settings.sampleRate,
+        (unsigned int)trimmed.getNumChannels(),
+        24,  // bits per sample
+        {},  // metadata StringPairArray
+        0    // quality hint
     );
-
-    if (writer == nullptr)
+    
+    if (rawWriter == nullptr)
     {
         sourceFile.status = ProcessingStatus::failed;
-        appState.appendLog("Error: Could not initialise writer for file - " + outputFile.getFileName());
+        appState.appendLog("ERROR: Could not initialize WAV writer for - " + outputFile.getFileName());
+        return;
+    }
+    
+    std::unique_ptr<juce::AudioFormatWriter> writer(rawWriter);
+
+    // Write audio data
+    if (!writer->writeFromAudioSampleBuffer(trimmed, 0, trimmed.getNumSamples()))
+    {
+        sourceFile.status = ProcessingStatus::failed;
+        appState.appendLog("ERROR: Failed to write audio data - " + outputFile.getFileName());
         return;
     }
 
-    writer->writeFromAudioSampleBuffer(trimmed, 0, trimmed.getNumSamples());
     writer.reset(); // Flush and close
 
     sourceFile.status = ProcessingStatus::completed;
-    appState.appendLog("Saved: " + outputFile.getFileName());
+    appState.appendLog("Saved: " + outputFile.getFileName() + 
+                      " (" + juce::String(trimmed.getNumSamples()) + " samples)");
 }
 
 juce::File MainComponent::generateOutputFile(const AudioFile& sourceFile)
@@ -1214,6 +1458,14 @@ juce::AudioBuffer<float> MainComponent::trimLatency(
             trimmed.copyFrom(ch, 0, captured, ch, startFrame, framesToCopy);
         }
     }
+    
+    // Debug: Log the trimming calculation
+    DBG("trimLatency: latencySamples=" << latencySamples << 
+        ", latencyFrames=" << latencyFrames <<
+        ", capturedFrames=" << capturedFrames << 
+        ", startFrame=" << startFrame <<
+        ", originalLength=" << originalLength <<
+        ", framesToCopy=" << framesToCopy);
 
     return trimmed;
 }

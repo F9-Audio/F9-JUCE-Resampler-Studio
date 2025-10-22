@@ -3,6 +3,67 @@
 ## IMPORTANT: Response Guidelines
 **Keep all responses concise - maximum 3-5 lines per summary. Focus on what changed and why.**
 
+---
+
+## ✅ IMPLEMENTED: Preview Audio System (2025-10-21)
+
+### Overview
+Complete Round Robin preview playback system that loops through selected files with configurable gaps.
+
+### Features Implemented
+1. **Round Robin Loop**: Preview continuously loops through selected files until stopped
+2. **Dynamic Button**: Changes between "▶ Preview Selected" and "■ Stop Preview"
+3. **Gap Control**: Respects `silenceBetweenFilesMs` slider for silence between files
+4. **Proper Routing**: Uses selected stereo output pair (just like latency measurement)
+5. **Clean UI**: Simplified drag-and-drop area with large down arrow (⬇️)
+
+### Key Implementation Details
+
+**Audio Callback (Preview Mode)**:
+```cpp
+// In getNextAudioBlock() - preview playback with gaps
+if (isInPreviewGap) {
+    // Play silence between files
+    previewGapSamplesRemaining -= samplesToSilence;
+    if (gap complete) load next file
+} else {
+    // Play current file through selected output pair
+    copy from currentPlaybackBuffer to output channels
+    if (file complete) start gap
+}
+```
+
+**File Loading**:
+```cpp
+bool loadNextFileForPreview() {
+    // Finds file by ID in preview playlist
+    // Loads into stereo currentPlaybackBuffer
+    // Handles mono → stereo conversion automatically
+}
+```
+
+**Loop Logic**:
+```cpp
+// When all files played, loop back to start
+if (all files complete) {
+    currentPreviewFileIndex = -1;
+    needsToLoadNextFile = true;  // Restart from first file
+}
+```
+
+**UI Management**:
+- No files: Show drag-and-drop area with down arrow
+- Files loaded: Show file list with "Clear All" button to return to drop zone
+- No overlapping components = no event conflicts
+
+**Files Modified**:
+- `Source/MainComponent.h` - Added preview state variables
+- `Source/MainComponent.cpp` - Preview playback logic in audio callback
+- `Source/FileListAndLogComponent.cpp` - Simplified drop zone, dynamic button text
+- `Source/AppState.h` - Preview playlist and progress tracking
+
+---
+
 ## JUCE Version & Best Practices
 **JUCE Version:** 8.x (current stable)
 **Always use latest JUCE APIs:**
